@@ -2,21 +2,50 @@ import tiktoken
 import time
 import torch
 import math
+import os
 from model import GPT, GPTConfig
 from dataloader import DataLoaderLite
+from torch.distributed import init_process_group, destroy_process_group
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-total_batch_size = 524288 # 2^19, ~0.5M tokens
-B = 4 # micro batch size
-T = 256 # sequence length
-assert total_batch_size % (B * T) == 0, "make sure the total batch size is divisible by B * T"
-grad_acc_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size:,} | micro batch size: {B} | sequence length: {T} | gradient accumulation steps: {grad_acc_steps}")
+#setup the DDP (Distributed Data Parallel)
+# torchrun command sets the env variables RANK, LOCAL_RANK, WORLD_SIZE
+ddp = int(os.environ.get("RANK", -1)) != -1 # check if we are in a DDP context
+if ddp:
+    #use of DDP atm demands CUDA, we set the device appropriately according to the rank
+    assert torch.cuda.is_available(), "for now i think DDP requires CUDA"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK']) # global rank of the process: ex:- GPU 0, GPU 1, etc.
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) # local rank of the GPU on single node (a node refers to a single computer or server that is part of a larger network or cluster of computers)
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # number of processes
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing, etc
+else:
+    #vanilla, non-DDP training
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    #attempt to autoconnect device
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    print(f"running on device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+total_batch_size = 524288 # 2^19, ~0.5M tokens
+B = 4 # micro batch size
+T = 256 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure the total batch size is divisible by B * T * ddp_world_size"
+grad_acc_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size:,} | micro batch size: {B} | sequence length: {T} | gradient accumulation steps: {grad_acc_steps}")
+
+print("GPU", ddp_rank)
+import sys; sys.exit(0)
 
 train_loader = DataLoaderLite(B=B, T=T)
 
